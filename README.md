@@ -26,3 +26,4 @@ Run ```vim ~/.config/simp-code/default_config.json```, and add your default conf
 
 and run ```simp-code -m 1``` to activate memory mode, or simply ```simp-code```.# SimpleCoder
 # SimpleCoder
+# SimpleCoder
