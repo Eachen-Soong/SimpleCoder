@@ -1,9 +1,6 @@
+from typing import List, Literal, Optional
+
 from langgraph.graph import MessagesState
-from typing import Optional, List, Dict, Literal
-
-from enum import Enum
-from typing import List, Optional
-
 from pydantic import BaseModel, Field
 
 
@@ -12,14 +9,15 @@ class Step(BaseModel):
     description: str = ""
     status: Literal["pending", "completed"] = "pending"
 
+
 class Plan(BaseModel):
     goal: str = ""
     thought: str = ""
-    steps: List[Step] = []
+    steps: List[Step] = Field(default_factory=list)
+
 
 class State(MessagesState):
     user_message: str = ""
-    plan: Plan
-    observations: List = []
-    final_report: str =  ""
-    
+    plan: Optional[Plan] = None
+    observations: List = Field(default_factory=list)
+    final_report: str = ""

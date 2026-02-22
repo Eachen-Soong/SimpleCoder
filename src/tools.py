@@ -1,9 +1,8 @@
 from langchain_core.tools import tool
 import os
-import traceback
 import subprocess
-import tempfile
 from pathlib import Path
+
 
 @tool
 def create_file(file_name, file_contents):
@@ -15,11 +14,15 @@ def create_file(file_name, file_contents):
         file_contents (str): The content to write to the file
     """
     try:
-        file_path = os.path.join(os.getcwd(), file_name)
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        file_path = Path(os.getcwd()) / file_name
+        file_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(file_path, 'w') as file:
+        with open(file_path, 'w', encoding='utf-8') as file:
             file.write(file_contents)
+        return {
+            "success": True,
+            "file_path": str(file_path)
+        }
 
     except Exception as e:
         return {
@@ -36,12 +39,20 @@ def str_replace(file_name, search, replace):
         old_str (str): Text to be replaced (must appear exactly once)
         new_str (str): Replacement text
     """
-    text = Path(file_name).read_text()
-    if search not in text:
-        return {"success": False}
-    text = text.replace(search, replace)
-    Path(file_name).write_text(text)
-    return {"success": True}
+    try:
+        file_path = Path(file_name)
+        text = file_path.read_text(encoding='utf-8')
+        occurrences = text.count(search)
+        if occurrences == 0:
+            return {"success": False, "error": "search text not found"}
+        if occurrences > 1:
+            return {"success": False, "error": "search text is ambiguous"}
+
+        text = text.replace(search, replace, 1)
+        file_path.write_text(text, encoding='utf-8')
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 @tool
 def send_message(message: str):
@@ -52,7 +63,8 @@ def send_message(message: str):
         message: the message to send to the user
     """
     return message
-tool()
+
+
 @tool
 def shell_exec(command: str) -> dict:
     """
@@ -75,13 +87,17 @@ def shell_exec(command: str) -> dict:
             text=True,
             check=False
         )
-        stdout = result.stdout if len(result.stdout) else 'Success'
-        res = {"message": {"stdout": stdout}}
-        if len(result.stderr): res.update({"stderr": result.stderr}) 
+        res = {
+            "message": {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": result.returncode
+            }
+        }
         return res
         
     except Exception as e:
-        return {"error": {"stderr": str(e)}}
+        return {"error": {"stderr": str(e), "returncode": -1}}
     
 tools = {"create_file": create_file, "str_replace": str_replace, "shell_exec": shell_exec}     
 report_tools = {"create_file": create_file, "shell_exec": shell_exec}     

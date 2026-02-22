@@ -1,9 +1,11 @@
 import json
 import logging
+import os
+
 from json_repair import loads
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langgraph.types import Command, Interrupt
+from langgraph.types import Command
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -14,12 +16,12 @@ from tools import *
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setLevel(logging.INFO)
-
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 llm = None
 try:
@@ -33,15 +35,15 @@ try:
         run_conf = json.load(f)
     
     if 'api_provider' not in run_conf:
-        raise KeyError("default_config.json 中缺少 'api_provider' 字段")
+        raise KeyError("Missing 'api_provider' in default_config.json")
     if 'model' not in run_conf:
-        raise KeyError("default_config.json 中缺少 'model' 字段")
+        raise KeyError("Missing 'model' in default_config.json")
     
     provider = run_conf['api_provider']
     if provider not in api_conf:
-        raise KeyError(f"api_config.json 中缺少 {provider} 配置")
+        raise KeyError(f"Missing {provider} config in api_config.json")
     if 'url' not in api_conf[provider] or 'key' not in api_conf[provider]:
-        raise KeyError(f"api_config.json 中 {provider} 缺少 url/key 字段")
+        raise KeyError(f"Missing url/key in {provider} of api_config.json")
     
     llm = ChatOpenAI(
         model=run_conf['model'],
@@ -57,24 +59,37 @@ except Exception as e:
 
 
 def extract_json(text: str):
-    if '```json' not in text:
+    if not isinstance(text, str):
         return text
-    text = text.split('```json')[1].split('```')[0].strip()
-    text = json.dumps(text,ensure_ascii=False)
-    return text
+    if '```json' in text:
+        return text.split('```json', 1)[1].split('```', 1)[0].strip()
+    if '```' in text:
+        parts = text.split('```')
+        if len(parts) >= 3:
+            return parts[1].strip()
+    return text.strip()
 
 def extract_answer(text: str):
+    if not isinstance(text, str):
+        return ""
     if '</think>' in text:
         answer = text.split('</think>')[-1]
         return answer.strip()
     return text
 
+def parse_model_json(content: str):
+    payload = loads(extract_json(extract_answer(content)))
+    if isinstance(payload, str):
+        payload = loads(payload)
+    if not isinstance(payload, dict):
+        raise ValueError("Model output is not a JSON object.")
+    return payload
+
 def create_planner_node(state: State):
     logger.info('***Running Planner Node***')
     messages = [SystemMessage(content=PLAN_SYSTEM_PROMPT), HumanMessage(content=PLAN_CREATE_PROMPT.format(user_message=state['user_message']))]
-    response = llm.invoke(messages).model_dump_json(indent=4, exclude_none=True)
-    response = json.loads(response)
-    plan = loads(extract_json(extract_answer(response['content'])))
+    response = llm.invoke(messages)
+    plan = parse_model_json(response.content)
     state['messages'] += [AIMessage(content=json.dumps(plan, ensure_ascii=False))]
     return Command(goto="execute", update={"plan": plan})
 
@@ -82,46 +97,45 @@ def update_planner_node(state: State):
     logger.info('***Running Update Planner Node***')
     plan = state['plan']
     goal = plan['goal']
-    state['messages'].extend([SystemMessage(content=PLAN_SYSTEM_PROMPT), HumanMessage(content=UPDATE_PLAN_PROMPT.format(plan=plan, goal=goal))])
-    messages = state['messages']
+    messages = state['messages'] + [
+        SystemMessage(content=PLAN_SYSTEM_PROMPT),
+        HumanMessage(content=UPDATE_PLAN_PROMPT.format(plan=plan, goal=goal))
+    ]
     while True:
+        response_content = ""
         try:
-            response = llm.invoke(messages).model_dump_json(indent=4, exclude_none=True)
-            response = json.loads(response)
-            plan = loads(extract_json(extract_answer(response['content'])))
+            response = llm.invoke(messages)
+            response_content = response.content
+            plan = parse_model_json(response_content)
             state['messages'] += [AIMessage(content=json.dumps(plan, ensure_ascii=False))]
             return Command(goto="execute", update={"plan": plan})
         except Exception as e:
-            print(e)
-            print(response)
+            logger.error(f"Planner update parsing failed: {e}; content={response_content}")
             messages += [HumanMessage(content=f"Json Format Error: {e}")]
 
 def execute_node(state: State):
     logger.info('***Running Execute Node***')
-    plan = state['plan']
-    steps = plan['steps']
+    plan = state.get('plan') or {}
+    steps = plan.get('steps', [])
     current_step = None
-    current_step_index = 0
 
     # Get the first incomplete step
-    for i, step in enumerate(steps):
-        status = step['status']
-        if status == 'pending':
+    for step in steps:
+        status = step.get('status', 'pending')
+        if status != 'completed':
             current_step = step
-            current_step_index = i
             break
     
     logger.info(f'Current STEP: {current_step}')
 
-    if current_step is None or current_step_index == len(steps)-1:
+    if current_step is None:
         return Command(goto='report')
     
     messages = state['observations'] + [SystemMessage(content=EXECUTE_SYSTEM_PROMPT), HumanMessage(content=EXECUTION_PROMPT.format(user_message=state['user_message'], step=current_step['description']))]
 
-    tool_result = None
+    tool_outputs = []
     
-    response = llm.bind_tools([create_file, str_replace, shell_exec], strict=True).invoke(messages)
-    ai_message = response
+    ai_message = llm.bind_tools([create_file, str_replace, shell_exec], strict=True).invoke(messages)
     
     messages.append(ai_message)
     
@@ -132,6 +146,7 @@ def execute_node(state: State):
                 tool_args = tool_call['args']
                 tool_result = tools[tool_name].invoke(tool_args)
                 logger.info(f'tool_name: {tool_name}, tool_args: {tool_args}\ntool_result: {tool_result}')
+                tool_outputs.append(f"{tool_name}: {tool_result}")
                 
                 tool_message = ToolMessage(
                     content=str(tool_result),
@@ -147,7 +162,7 @@ def execute_node(state: State):
                     name=tool_call['name']
                 )
                 messages.append(tool_message)
-    elif '<tool_call>' in ai_message.content:
+    elif isinstance(ai_message.content, str) and '<tool_call>' in ai_message.content:
         tool_call_str = ai_message.content.split('<tool_call>')[-1].split('</tool_call>')[0].strip()
         try:
             tool_call = json.loads(tool_call_str)
@@ -155,11 +170,14 @@ def execute_node(state: State):
             tool_args = tool_call['args']
             tool_result = tools[tool_name].invoke(tool_args)
             logger.info(f'Custom tool call - name: {tool_name}, args: {tool_args}, result: {tool_result}')
+            tool_outputs.append(f"{tool_name}: {tool_result}")
             messages.append(AIMessage(content=f"Tool {tool_name} executed: {tool_result}"))
         except Exception as e:
             logger.error(f"Custom tool call failed: {e}")
             messages.append(AIMessage(content=f"Custom tool call error: {str(e)}"))
     answer = extract_answer(ai_message.content)
+    if not answer and tool_outputs:
+        answer = "\n".join(tool_outputs)
 
     logger.info(f'***Review of Current Step:***\n{answer}')
     state['messages'] += [AIMessage(content=answer)]
@@ -169,34 +187,43 @@ def execute_node(state: State):
 def report_node(state: State):
     """Generates Final Report of the Task"""
     logger.info('***Running Report Node***')
-    observations = state.get('observations')
+    observations = state.get('observations', [])
     messages = observations + [SystemMessage(content=REPORT_SYSTEM_PROMPT)]
+    final_report = ""
     
     while True:
         response = llm.bind_tools([create_file, shell_exec], strict=True).invoke(messages)
-        response = response.model_dump_json(indent=4, exclude_none=True)
-        response = json.loads(response)
-        if response['tool_calls']:
-            for tool_call in response['tool_calls']:
+        messages.append(response)
+        if getattr(response, 'tool_calls', None):
+            for tool_call in response.tool_calls:
                 tool_name = tool_call['name']
                 tool_args = tool_call['args']
-                tool_result = report_tools[tool_name].invoke(tool_args)
+                if tool_name not in report_tools:
+                    tool_result = {"error": f"Unknown tool: {tool_name}"}
+                else:
+                    tool_result = report_tools[tool_name].invoke(tool_args)
                 logger.info(f'tool_name: {tool_name}, tool_args: {tool_args}\ntool_result: {tool_result}')
                 messages.append(ToolMessage(
                     content=str(tool_result),
-                    tool_call_id=tool_call.get('id', '')
+                    tool_call_id=tool_call.get('id', ''),
+                    name=tool_name
                 ))
-        elif '<tool_call>' in response['content']:
-            tool_call = response['content'].split('<tool_call>')[-1].split('</tool_call>')[0].strip()
+        elif isinstance(response.content, str) and '<tool_call>' in response.content:
+            tool_call = response.content.split('<tool_call>')[-1].split('</tool_call>')[0].strip()
             tool_call = json.loads(tool_call)
             tool_name = tool_call['name']
             tool_args = tool_call['args']
-            tool_result = report_tools[tool_name].invoke(tool_args)
+            if tool_name not in report_tools:
+                tool_result = {"error": f"Unknown tool: {tool_name}"}
+            else:
+                tool_result = report_tools[tool_name].invoke(tool_args)
             logger.info(f'tool_name: {tool_name}, tool_args: {tool_args}\ntool_result: {tool_result}')
-            messages.append(ToolMessage(content=str(tool_result)))
-        else: break
+            messages.append(ToolMessage(content=str(tool_result), tool_call_id='', name=tool_name))
+        else:
+            final_report = extract_answer(response.content)
+            break
 
-    return {'final_report': response['content']}
+    return {'final_report': final_report}
 
 def _build_base_graph():
     """Build and return the base state graph with all nodes and edges."""

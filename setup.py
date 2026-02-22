@@ -16,6 +16,7 @@ setup(
 
     packages=find_packages(where="src"),
     package_dir={"": "src"},
+    py_modules=["main", "workflow", "tools", "state", "prompts"],
     python_requires=">=3.8",
 
     entry_points={
@@ -31,7 +32,7 @@ setup(
         "pydantic>=2.0.0",
         "openai>=1.0.0",
         "python-dotenv>=1.0.0",
-        "json_repair?=0.50"
+        "json_repair>=0.50"
     ],
 
     classifiers=[
